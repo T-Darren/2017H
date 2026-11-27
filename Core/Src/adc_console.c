@@ -61,13 +61,38 @@ static uint8_t ADC_Stale(void)
   return (uint32_t)(HAL_GetTick() - adc.sample_tick) > 1000U;
 }
 
+static uint8_t ADC_CalibrationActive(void)
+{
+  return ADC_CALIBRATION_ENABLED &&
+         adc.channel == ADC_CALIBRATION_CHANNEL &&
+         adc.gain == ADC_CALIBRATION_GAIN &&
+         adc.rate == ADC_CALIBRATION_RATE &&
+         adc.reference_uv == ADC_CALIBRATION_REFERENCE_UV;
+}
+
+static int32_t ADC_CalibratedVoltage(int32_t voltage_uv)
+{
+  if (!ADC_CalibrationActive())
+  {
+    return voltage_uv;
+  }
+  int64_t scaled = ((int64_t)voltage_uv - ADC_CALIBRATION_OFFSET_UV) *
+                   ADC_CALIBRATION_GAIN_PPM;
+  return (int32_t)((scaled + (scaled >= 0 ? 500000LL : -500000LL)) / 1000000LL);
+}
+
 static void ADC_Status(void)
 {
-  ADC_Print("ADC %s ID=%u AIN%u-AINCOM GAIN=%u RATE=%luSPS VREF=%lumV BUF=OFF STREAM=%s\r\n",
+  ADC_Print("ADC %s ID=%u AIN%u-AINCOM GAIN=%u RATE=%luSPS VREF=%lumV BUF=OFF STREAM=%s CAL=%s\r\n",
             adc.initialized ? (ADC_Stale() ? "STALE" : "OK") : "NOT_READY",
             (unsigned)adc.chip_id, (unsigned)adc.channel, (unsigned)adc.gain,
             (unsigned long)adc.rate, (unsigned long)(adc.reference_uv / 1000U),
-            streaming ? "ON" : "OFF");
+            streaming ? "ON" : "OFF", ADC_CalibrationActive() ? "ON" : "OFF");
+  if (ADC_CalibrationActive())
+  {
+    ADC_Print("ADC CAL OFFSET=%lduV SCALE=%ld/1000000\r\n",
+              (long)ADC_CALIBRATION_OFFSET_UV, (long)ADC_CALIBRATION_GAIN_PPM);
+  }
   ADC_Print("ADC N=%lu DRDY_EDGES=%lu HAS_SAMPLE=%u AGE=%lums ERROR=%s\r\n",
             (unsigned long)adc.samples, (unsigned long)adc.drdy_edges,
             (unsigned)adc.has_sample,
@@ -86,12 +111,18 @@ static void ADC_Report(void)
     ADC_Print("ERR ADC no fresh sample; check DRDY/power, then ADC INIT\r\n");
     return;
   }
-  uint32_t magnitude = (uint32_t)(adc.voltage_uv < 0 ? -adc.voltage_uv : adc.voltage_uv);
-  ADC_Print("ADC AIN%u RAW=%ld U=%s%lu.%03lumV AGE=%lums N=%lu SAT=%u\r\n",
+  int32_t voltage_uv = ADC_CalibratedVoltage(adc.voltage_uv);
+  uint32_t magnitude = (uint32_t)(voltage_uv < 0 ? -voltage_uv : voltage_uv);
+  uint32_t uncalibrated_magnitude = (uint32_t)(adc.voltage_uv < 0 ?
+                                              -adc.voltage_uv : adc.voltage_uv);
+  ADC_Print("ADC AIN%u RAW=%ld U=%s%lu.%03lumV U_UNCAL=%s%lu.%03lumV AGE=%lums N=%lu SAT=%u\r\n",
             (unsigned)adc.channel, (long)adc.raw,
-            adc.voltage_uv < 0 ? "-" : "",
+            voltage_uv < 0 ? "-" : "",
             (unsigned long)(magnitude / 1000U),
             (unsigned long)(magnitude % 1000U),
+            adc.voltage_uv < 0 ? "-" : "",
+            (unsigned long)(uncalibrated_magnitude / 1000U),
+            (unsigned long)(uncalibrated_magnitude % 1000U),
             (unsigned long)(HAL_GetTick() - adc.sample_tick),
             (unsigned long)adc.samples,
             (unsigned)(adc.raw == -8388608 || adc.raw == 8388607));
@@ -104,6 +135,7 @@ void ADC_Console_Help(void)
   ADC_Print("ADC rates: 10,15,25,30,50,60,100,500,1000,2000,3750,7500,15000,30000\r\n");
   ADC_Print("ADC ON reports latest voltage every %lums; not a lossless sample stream.\r\n",
             (unsigned long)ADC_REPORT_INTERVAL_MS);
+  ADC_Print("ADC U=calibrated when CAL=ON; U_UNCAL=before calibration; RAW=original code.\r\n");
 }
 
 uint8_t ADC_Console_Command(char *const *tokens, uint32_t count)
@@ -158,8 +190,8 @@ uint8_t ADC_Console_Command(char *const *tokens, uint32_t count)
     if (strcmp(tokens[1], "vref") == 0 && value >= 500U && value <= 3300U)
     {
       ADS1256_SetReference(&adc, value * 1000U);
-      ADC_Print("OK ADC VREF=%lumV; software scaling only, use measured VREF\r\n",
-                (unsigned long)value);
+      ADC_Print("OK ADC VREF=%lumV; software scaling only, use measured VREF; CAL=%s\r\n",
+                (unsigned long)value, ADC_CalibrationActive() ? "ON" : "OFF");
       return 1U;
     }
     uint8_t channel = adc.channel;
